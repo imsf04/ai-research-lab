@@ -1,68 +1,57 @@
-import { DocumentUpload } from "./DocumentUpload";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-interface ProjectItem {
-  id: string;
-  key: string;
-  title: string;
-  updatedAt?: string;
+import {
+  createProject,
+  decideApproval,
+  deleteTask,
+  fetchEvents,
+  fetchTask,
+  followUp,
+  resumeTask,
+  type AuditEvent,
+  type ProjectCredential,
+  type ResearchTask,
+  type TaskStatus,
+} from "./api";
+import { ApprovalDock } from "./components/ApprovalDock";
+import { Composer } from "./components/Composer";
+import { Sidebar } from "./components/Sidebar";
+import { SourcesRail } from "./components/SourcesRail";
+import { Thread } from "./components/Thread";
+import { TopBar } from "./components/TopBar";
+import { Welcome } from "./components/Welcome";
+import { classNames, maxSeq, mergeEvents } from "./format";
+import {
+  loadCredential,
+  loadProjects,
+  mergeProjectMeta,
+  saveCredential,
+  saveProjects,
+  sortProjects,
+  upsertProject,
+  type ProjectItem,
+} from "./projects";
+import { buildRun, buildTurns, mergeSourceLists } from "./run";
+
+const ACTOR = "本机用户";
+
+type HealthState = "checking" | "online" | "offline";
+
+interface Toast {
+  id: number;
+  message: string;
+  tone: "info" | "error";
 }
 
-interface Task {
-  id: string;
-  title?: string;
-  question: string;
-  status: string;
-  report: string;
-  error: string;
-  approval: {
-    id: string;
-    kind: string;
-    query: string;
-    question: string;
-    questions: string[];
-    reason: string;
-    expiresAt: string;
-    goal?: string;
-    serves?: string;
-  } | null;
-  snapshot?: {
-    next?: string;
-    phase?: string;
-    calls?: number;
-    units?: number;
-    retries?: number;
-    state: {
-      sources: {
-        id: string;
-        url?: string;
-        title?: string;
-        sourceKind?: string;
-        documentId: string;
-        content: string;
-        startLine: number;
-        endLine: number;
-      }[];
-    };
-  } | null;
-  audit: {
-    seq: number;
-    actor: string;
-    action: string;
-    created_at: string;
-    detail?: Record<string, unknown>;
-  }[];
-}
-
-export function summarizeProjectTitle(message: string): string {
+function summarizeTitle(message: string): string {
   const withoutAttachments = message
     .split(/\n请优先检索本地上传资料：/)[0]!
     .trim();
   const firstClause =
     withoutAttachments
       .split(/[\n。？！?!；;]+/)
-      .map((s) => s.trim())
-      .find((s) => s.length > 0) ?? withoutAttachments;
+      .map((part) => part.trim())
+      .find((part) => part.length > 0) ?? withoutAttachments;
   const stripped = firstClause
     .replace(
       /^(请问一下|请问|请帮我|帮我|请解释一下|请解释|解释一下|请分析一下|请分析|分析一下|请研究一下|研究一下|调研一下|调查一下|告诉我|我想知道)\s*/i,
@@ -74,506 +63,559 @@ export function summarizeProjectTitle(message: string): string {
   return text.length > 28 ? `${text.slice(0, 28)}…` : text;
 }
 
-const HELP_MESSAGE = [
-  "命令帮助 (/help)：",
-  "  • 直接输入内容：在项目列表中将创建新项目；在项目内则继续追问或修改报告",
-  "  • /projects：返回并查看项目列表",
-  "  • /new [问题]：创建新项目",
-  "  • /delete：删除当前项目",
-  "  • /help：显示本帮助说明",
-].join("\n");
+function errorText(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
 
-export function HumanResearch() {
-  const outputRef = useRef<HTMLDivElement>(null);
-  const [attachments, setAttachments] = useState<string[]>([]);
-  const [question, setQuestion] = useState("");
-  const actor = "本机用户";
-  const [projects, setProjects] = useState<ProjectItem[]>(() => {
-    try {
-      return JSON.parse(
-        localStorage.getItem("human-research-projects") ?? "[]",
-      );
-    } catch {
-      return [];
-    }
-  });
-  const [credential, setCredential] = useState<{
-    id: string;
-    key: string;
-    title?: string;
-  } | null>(() => {
-    try {
-      return JSON.parse(localStorage.getItem("human-research") ?? "null");
-    } catch {
-      return null;
-    }
-  });
-  const [task, setTask] = useState<Task | null>(null);
-  const [value, setValue] = useState("");
+function initialProjects(): ProjectItem[] {
+  const projects = sortProjects(loadProjects());
+  const active = loadCredential();
+  if (!active || projects.some((project) => project.id === active.id)) {
+    return projects;
+  }
+  return [
+    {
+      id: active.id,
+      key: active.key,
+      title: active.title ?? "Untitled research",
+      ...(active.updatedAt ? { updatedAt: active.updatedAt } : {}),
+    },
+    ...projects,
+  ];
+}
+
+export function HumanResearch({ health = "online" }: { health?: HealthState }) {
+  const [projects, setProjects] = useState<ProjectItem[]>(initialProjects);
+  const [credential, setCredential] = useState<ProjectCredential | null>(
+    loadCredential,
+  );
+  const [task, setTask] = useState<ResearchTask | null>(null);
+  const [events, setEvents] = useState<AuditEvent[]>([]);
   const [error, setError] = useState("");
-  const [helpShown, setHelpShown] = useState(false);
+  const [loading, setLoading] = useState(Boolean(loadCredential()));
+  const [question, setQuestion] = useState("");
+  const [attachments, setAttachments] = useState<string[]>([]);
+  const [approvalValue, setApprovalValue] = useState("");
   const [busy, setBusy] = useState(false);
-  const [tick, setTick] = useState(0);
-  const [events, setEvents] = useState<Task["audit"]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [railOpen, setRailOpen] = useState(() => window.innerWidth >= 1180);
+  const [railTab, setRailTab] = useState<"sources" | "activity">("sources");
+  const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
+  const [toast, setToast] = useState<Toast | null>(null);
+  const [now, setNow] = useState(() => Date.now());
 
-  function saveProjectsList(nextList: ProjectItem[]) {
-    setProjects(nextList);
-    try {
-      localStorage.setItem("human-research-projects", JSON.stringify(nextList));
-    } catch {
-      // ignore storage quota errors
-    }
-  }
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const stickToBottom = useRef(true);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTaskState = useRef("");
 
-  function openProject(item: ProjectItem) {
-    setCredential(item);
-    setTask(null);
-    setEvents([]);
-    setHelpShown(false);
-  }
+  const notify = useCallback(
+    (message: string, tone: "info" | "error" = "info") => {
+      setToast({ id: Date.now(), message, tone });
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      toastTimer.current = setTimeout(() => setToast(null), 2600);
+    },
+    [],
+  );
 
-  function exitToProjectList() {
-    localStorage.removeItem("human-research");
-    setCredential(null);
-    setTask(null);
-    setEvents([]);
-  }
+  useEffect(
+    () => () => {
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+    },
+    [],
+  );
 
-  async function deleteProject(target: { id: string; key: string }) {
-    setBusy(true);
-    setError("");
-    try {
-      await fetch(`/api/research/tasks/${target.id}`, {
-        method: "DELETE",
-        headers: { "x-research-key": target.key },
-      }).catch(() => undefined);
-      const nextList = projects.filter((p) => p.id !== target.id);
-      saveProjectsList(nextList);
-      if (credential?.id === target.id) {
-        exitToProjectList();
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
+  useEffect(() => saveProjects(projects), [projects]);
+  useEffect(() => saveCredential(credential), [credential]);
 
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Poll the durable task plus its event cursor. The stream is finite, so a
+  // failed tick only delays the next attempt; research keeps running server-side.
   useEffect(() => {
     if (!credential) return;
     const controller = new AbortController();
+    let cancelled = false;
     let cursor = 0;
-    const history: Task["audit"] = [];
-    setEvents([]);
-    let timer: ReturnType<typeof setTimeout>;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setLoading(true);
+
     const poll = async () => {
       try {
-        const response = await fetch(`/api/research/tasks/${credential.id}`, {
-          headers: { "x-research-key": credential.key },
-          signal: controller.signal,
-        });
-        const body = (await response.json()) as Task & { error?: string };
-        if (!response.ok) throw new Error(body.error ?? "查询失败");
-        if (!controller.signal.aborted) {
-          const eventResponse = await fetch(
-            `/api/research/tasks/${credential.id}/events?after=${cursor}`,
-            {
-              headers: { "x-research-key": credential.key },
-              signal: controller.signal,
-            },
-          );
-          if (!eventResponse.ok) throw new Error("事件补载失败");
-          const eventText = await eventResponse.text();
-          for (const line of eventText.split("\n")) {
-            if (!line.startsWith("data: ")) continue;
-            const item = JSON.parse(line.slice(6)) as Task["audit"][number];
-            if (Number(item.seq) > cursor) {
-              history.push(item);
-              cursor = Number(item.seq);
-            }
-          }
-          if (controller.signal.aborted) return;
-          const resolvedTitle =
-            body.title ||
-            credential.title ||
-            summarizeProjectTitle(body.question || "未命名项目");
-          body.title = resolvedTitle;
-          setEvents([...history]);
-          setTask(body);
-          setError("");
-          timer = setTimeout(() => void poll(), 1500);
+        const [freshTask, freshEvents] = await Promise.all([
+          fetchTask(credential.id, credential.key, controller.signal),
+          fetchEvents(credential.id, credential.key, cursor, controller.signal),
+        ]);
+        if (cancelled) return;
+        const combined = mergeEvents(freshTask.audit ?? [], freshEvents);
+        cursor = maxSeq(combined);
+        setTask(freshTask);
+        if (freshEvents.length > 0) {
+          setEvents((current) => mergeEvents(current, freshEvents));
         }
-      } catch (e) {
-        if (!controller.signal.aborted) {
-          setError(e instanceof Error ? e.message : "查询失败");
-          timer = setTimeout(() => void poll(), 3000);
+        if (combined.length > 0) {
+          setEvents((current) => mergeEvents(current, combined));
         }
+        setLoading(false);
+        setError("");
+        setProjects((current) =>
+          mergeProjectMeta(current, credential.id, {
+            ...(freshTask.title ? { title: freshTask.title } : {}),
+            status: freshTask.status,
+            ...(freshTask.updatedAt ? { updatedAt: freshTask.updatedAt } : {}),
+          }),
+        );
+        setCredential((current) =>
+          current &&
+          current.id === credential.id &&
+          freshTask.title &&
+          current.title !== freshTask.title
+            ? { ...current, title: freshTask.title }
+            : current,
+        );
+      } catch (caught) {
+        if (cancelled || controller.signal.aborted) return;
+        setLoading(false);
+        setError(errorText(caught, "无法连接 API，正在重试…"));
+      } finally {
+        if (!cancelled) timer = setTimeout(() => void poll(), 1500);
       }
     };
+
     void poll();
     return () => {
+      cancelled = true;
       controller.abort();
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
     };
-  }, [credential, tick]);
+  }, [credential?.id, credential?.key, refreshTick]);
 
   useEffect(() => {
-    setValue(
-      task?.approval?.kind === "clarification"
+    if (!task?.approval) return;
+    setApprovalValue(
+      task.approval.kind === "clarification"
         ? task.approval.question
-        : (task?.approval?.query ?? ""),
+        : task.approval.query,
     );
   }, [task?.approval?.id]);
 
-  async function send(action?: "approve" | "reject" | "resume") {
-    const trimmed = question.trim();
-    if (!action) {
-      if (trimmed === "/help") {
-        setHelpShown(true);
-        setQuestion("");
-        return;
-      }
-      if (trimmed === "/projects" || trimmed === "/back") {
-        exitToProjectList();
-        setQuestion("");
-        return;
-      }
-      if (trimmed === "/delete" && credential) {
-        setQuestion("");
-        await deleteProject(credential);
-        return;
-      }
-    }
+  useEffect(() => {
+    stickToBottom.current = true;
+    const node = scrollRef.current;
+    node?.scrollTo?.({ top: 0 });
+  }, [credential?.id]);
 
+  const turns = useMemo(
+    () => (task ? buildTurns(task, events) : []),
+    [task, events],
+  );
+  const runs = useMemo(
+    () => turns.map((turn) => buildRun(turn.events)),
+    [turns],
+  );
+  const sources = useMemo(() => {
+    const snapshot = task?.snapshot?.state.sources ?? [];
+    const collected = runs.flatMap((run) => run.sources);
+    return mergeSourceLists(snapshot, collected);
+  }, [task, runs]);
+
+  // Completed runs open at the top of their latest report instead of the very
+  // bottom of a long scroll, so the verdict badge and title are visible first.
+  useEffect(() => {
+    if (!task) {
+      lastTaskState.current = "";
+      return;
+    }
+    const stamp = `${task.id}:${task.status}`;
+    if (lastTaskState.current === stamp) return;
+    lastTaskState.current = stamp;
+    if (task.status !== "completed" || !task.report || !stickToBottom.current) {
+      return;
+    }
+    const node = scrollRef.current;
+    const cards = node?.querySelectorAll<HTMLElement>(".report-card");
+    const card = cards?.[cards.length - 1];
+    if (!node || !card) return;
+    const offset =
+      card.getBoundingClientRect().top -
+      node.getBoundingClientRect().top +
+      node.scrollTop;
+    node.scrollTop = Math.max(0, offset - 18);
+  }, [task?.id, task?.status]);
+
+  useEffect(() => {
+    if (!stickToBottom.current) return;
+    if (task?.status === "completed") return;
+    const node = scrollRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [events.length, task?.report, task?.status, turns.length, approvalValue]);
+
+  const status: TaskStatus | "idle" =
+    task?.status ?? (credential ? "queued" : "idle");
+  const title =
+    task?.title ??
+    credential?.title ??
+    (credential ? "Untitled research" : "New research");
+  const approval =
+    task?.approval && task.status === "pending" ? task.approval : null;
+  const disabled =
+    Boolean(credential) &&
+    ["queued", "ready", "running", "pending"].includes(status);
+  const disabledReason = approval
+    ? "Review and approve the request above to continue."
+    : status === "running" || status === "queued" || status === "ready"
+      ? "The agent is researching. New steps stream in automatically."
+      : undefined;
+
+  const openProject = useCallback((project: ProjectItem) => {
+    setCredential({
+      id: project.id,
+      key: project.key,
+      ...(project.title ? { title: project.title } : {}),
+      ...(project.updatedAt ? { updatedAt: project.updatedAt } : {}),
+    });
+    setTask(null);
+    setEvents([]);
+    setError("");
+    setActiveSourceId(null);
+    setApprovalValue("");
+    setAttachments([]);
+    setQuestion("");
+    setSidebarOpen(false);
+    setLoading(true);
+  }, []);
+
+  const startNew = useCallback(() => {
+    setCredential(null);
+    setTask(null);
+    setEvents([]);
+    setError("");
+    setQuestion("");
+    setAttachments([]);
+    setActiveSourceId(null);
+    setSidebarOpen(false);
+    setLoading(false);
+    setTimeout(() => composerRef.current?.focus(), 0);
+  }, []);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        startNew();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [startNew]);
+
+  async function submit() {
+    const trimmed = question.trim();
+    if (!trimmed || busy) return;
     setBusy(true);
     setError("");
+    const prompt = attachments.length
+      ? `${trimmed}\n请优先检索本地上传资料：${attachments.join("、")}`
+      : trimmed;
     try {
-      const cleanQuestion = trimmed.startsWith("/new ")
-        ? trimmed.slice(5).trim()
-        : trimmed;
-      const isFollowup =
-        !action && Boolean(credential) && !trimmed.startsWith("/new ");
-      const endpoint = action
-        ? `/api/research/tasks/${credential!.id}/${action}`
-        : isFollowup
-          ? `/api/research/tasks/${credential!.id}/followup`
-          : "/api/research/tasks";
-
-      const promptWithAttachments = attachments.length
-        ? `${cleanQuestion}\n请优先检索本地上传资料：${attachments.join("、")}`
-        : cleanQuestion;
-
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(credential && (action || isFollowup)
-            ? { "x-research-key": credential.key }
-            : {}),
-        },
-        body: JSON.stringify(
-          action
-            ? {
-                actor,
-                approvalId: task?.approval?.id,
-                ...(action === "approve" ? { value } : {}),
-              }
-            : {
-                actor,
-                question: promptWithAttachments,
-              },
-        ),
-      });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "操作失败");
-      if (!action && !isFollowup) {
-        const title =
-          body.title || summarizeProjectTitle(cleanQuestion || "未命名项目");
-        const newProj: ProjectItem = {
-          id: body.id,
-          key: body.key,
-          title,
+      if (credential) {
+        await followUp(credential.id, credential.key, prompt, ACTOR);
+      } else {
+        const created = await createProject(prompt, ACTOR);
+        const project: ProjectItem = {
+          id: created.id,
+          key: created.key,
+          title: created.title ?? summarizeTitle(trimmed),
           updatedAt: new Date().toISOString(),
+          status: "queued",
         };
-        saveProjectsList([
-          newProj,
-          ...projects.filter((p) => p.id !== newProj.id),
-        ]);
-        setCredential(newProj);
+        setProjects((current) => sortProjects(upsertProject(current, project)));
+        setCredential(project);
         setTask(null);
-        setAttachments([]);
+        setEvents([]);
+        setLoading(true);
       }
-      if (!action) {
-        setQuestion("");
-      }
-      setTick((t) => t + 1);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "操作失败");
+      setQuestion("");
+      setAttachments([]);
+      setRefreshTick((tick) => tick + 1);
+    } catch (caught) {
+      setError(errorText(caught, "操作失败"));
     } finally {
       setBusy(false);
     }
   }
 
-  useEffect(() => {
-    const output = outputRef.current;
-    if (output) output.scrollTop = output.scrollHeight;
-  }, [
-    events.length,
-    task?.report,
-    task?.status,
-    task?.approval?.id,
-    error,
-    helpShown,
-  ]);
+  async function approve() {
+    if (!credential || !task?.approval || !approvalValue.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await decideApproval(credential.id, credential.key, "approve", {
+        actor: ACTOR,
+        approvalId: task.approval.id,
+        value: approvalValue.trim(),
+      });
+      setRefreshTick((tick) => tick + 1);
+    } catch (caught) {
+      setError(errorText(caught, "审批失败"));
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  const activeTitle =
-    task?.title ||
-    credential?.title ||
-    (task?.question ? summarizeProjectTitle(task.question) : null);
+  async function reject() {
+    if (!credential || !task?.approval) return;
+    setBusy(true);
+    setError("");
+    try {
+      await decideApproval(credential.id, credential.key, "reject", {
+        actor: ACTOR,
+        approvalId: task.approval.id,
+      });
+      setRefreshTick((tick) => tick + 1);
+    } catch (caught) {
+      setError(errorText(caught, "审批失败"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resume() {
+    if (!credential) return;
+    setBusy(true);
+    setError("");
+    try {
+      await resumeTask(credential.id, credential.key, ACTOR);
+      setRefreshTick((tick) => tick + 1);
+    } catch (caught) {
+      setError(errorText(caught, "无法恢复任务"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeProject(project: ProjectItem) {
+    setBusy(true);
+    try {
+      await deleteTask(project.id, project.key);
+      setProjects((current) =>
+        current.filter((item) => item.id !== project.id),
+      );
+      if (credential?.id === project.id) startNew();
+      notify("Project deleted");
+    } catch (caught) {
+      setError(errorText(caught, "删除失败"));
+      notify(errorText(caught, "删除失败"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function refresh() {
+    setRefreshing(true);
+    setRefreshTick((tick) => tick + 1);
+    setTimeout(() => setRefreshing(false), 700);
+  }
+
+  function handleCitation(source: { id: string }) {
+    setActiveSourceId(source.id);
+    setRailTab("sources");
+    setRailOpen(true);
+  }
+
+  function handleScroll() {
+    const node = scrollRef.current;
+    if (!node) return;
+    stickToBottom.current =
+      node.scrollHeight - node.scrollTop - node.clientHeight < 140;
+  }
+
+  const railVisible = railOpen && Boolean(credential);
 
   return (
-    <section className="terminal-workspace">
-      <div
-        ref={outputRef}
-        className="terminal-output"
-        role="log"
-        aria-label="研究终端输出"
-        tabIndex={0}
-      >
-        {!task && !credential && (
-          <div className="terminal-welcome">
-            <p>项目列表（共 {projects.length} 个项目）</p>
-            {projects.length === 0 ? (
-              <p>
-                暂无项目，在下方直接输入问题新建项目，或输入 /help 查看帮助。
-              </p>
-            ) : (
-              <ul>
-                {projects.map((p, index) => (
-                  <li key={p.id}>
-                    {index + 1}. {p.title} <small>({p.id.slice(0, 8)})</small>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
-        {helpShown && <pre aria-label="帮助信息">{HELP_MESSAGE}</pre>}
-        {task && (
-          <>
-            <p className="terminal-prompt">
-              ❯ {activeTitle ?? summarizeProjectTitle(task.question)}
-            </p>
-            <p role="status">任务状态：{task.status}</p>
-            <small>任务 ID：{task.id}</small>
-            <ol className="conversation-events" aria-label="研究对话">
-              {(events.length ? events : task.audit).map((e) => (
-                <li key={e.seq}>
-                  <span className="event-marker">·</span>
-                  <div>
-                    <small>
-                      {e.actor} · {e.action}
-                    </small>
-                    <span>
-                      {typeof e.detail?.message === "string"
-                        ? e.detail.message
-                        : typeof e.detail?.node === "string"
-                          ? e.detail.node
-                          : e.action}
-                    </span>
+    <div className="app-shell">
+      {sidebarOpen && (
+        <button
+          type="button"
+          className="sidebar-scrim"
+          aria-label="Close sidebar"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+      <Sidebar
+        projects={projects}
+        activeId={credential?.id}
+        health={health}
+        open={sidebarOpen}
+        now={now}
+        onSelect={openProject}
+        onNew={startNew}
+        onDelete={(project) => void removeProject(project)}
+        onClose={() => setSidebarOpen(false)}
+      />
+
+      <div className="workspace">
+        <TopBar
+          title={title}
+          status={status}
+          isNew={!credential}
+          turnCount={turns.length}
+          sourceCount={sources.length}
+          railOpen={railVisible}
+          refreshing={refreshing}
+          onMenu={() => setSidebarOpen(true)}
+          onRefresh={refresh}
+          onToggleRail={() => setRailOpen((open) => !open)}
+        />
+
+        <div className={classNames("stage", railVisible && "has-rail")}>
+          <div className="thread-pane">
+            {!credential ? (
+              <main
+                className="conversation welcome-scroll"
+                ref={scrollRef}
+                onScroll={handleScroll}
+              >
+                <Welcome
+                  onPick={(suggestion) => {
+                    setQuestion(suggestion);
+                    composerRef.current?.focus();
+                  }}
+                />
+              </main>
+            ) : loading && !task ? (
+              <main
+                className="conversation"
+                role="status"
+                aria-label="Loading project"
+              >
+                <div className="loading-thread">
+                  <span className="skeleton line-lg" />
+                  <span className="skeleton line-md" />
+                  <div className="loading-steps">
+                    <span className="skeleton step" />
+                    <span className="skeleton step" />
+                    <span className="skeleton step" />
                   </div>
-                </li>
-              ))}
-            </ol>
-            {task.snapshot && (
-              <p className="terminal-meter">
-                节点 {task.snapshot.next ?? "—"} · 调用{" "}
-                {task.snapshot.calls ?? 0} · 文本预留 {task.snapshot.units ?? 0}{" "}
-                · 重试 {task.snapshot.retries ?? 0}
-              </p>
+                  <span className="loading-label">Loading project…</span>
+                </div>
+              </main>
+            ) : task ? (
+              <Thread
+                turns={turns}
+                runs={runs}
+                sources={sources}
+                status={status}
+                taskError={task.error}
+                error={error}
+                scrollRef={scrollRef}
+                onCitation={handleCitation}
+                onOpenSources={() => {
+                  setRailTab("sources");
+                  setRailOpen(true);
+                }}
+                onToast={notify}
+              />
+            ) : (
+              <main className="conversation" role="status">
+                <div className="loading-label">
+                  Waiting for the first event…
+                </div>
+              </main>
             )}
-            {task.approval && task.status === "pending" && (
-              <p className="terminal-notice">
-                等待审批：{task.approval.reason} 请在底部确认。
-              </p>
-            )}
-            {task.error && <p role="alert">{task.error}</p>}
-            {task.report && (
-              <pre className="report-message" aria-label="研究报告">
-                {task.report}
-              </pre>
-            )}
-            {task.snapshot?.state.sources.map((source) => (
-              <div className="terminal-source" key={source.id}>
-                <p>
-                  [{source.id}] {source.title ?? source.documentId}
-                  {source.url
-                    ? " · 搜索摘要（非网页全文）"
-                    : ` · 第 ${source.startLine}–${source.endLine} 行`}
-                </p>
-                <pre>{source.content}</pre>
-              </div>
-            ))}
-          </>
-        )}
-        {error && <p role="alert">{error}</p>}
-      </div>
-      <div className="terminal-dock" aria-label="研究操作区">
-        <div className="dock-toolbar">
-          <span>
-            {task?.status === "pending"
-              ? "? 等待你的决定"
-              : task?.status === "running"
-                ? "● 研究进行中"
-                : activeTitle
-                  ? `当前项目：${activeTitle}`
-                  : "❯ 项目列表"}
-          </span>
-          {!credential && projects.length > 0 && (
-            <div>
-              {projects.map((p) => (
-                <span key={p.id}>
-                  <button
-                    type="button"
-                    className="secondary"
-                    disabled={busy}
-                    onClick={() => openProject(p)}
-                  >
-                    打开：{p.title}
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary"
-                    disabled={busy}
-                    onClick={() => void deleteProject(p)}
-                  >
-                    删除
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-          {credential && (
-            <div>
-              <button
-                type="button"
-                className="secondary"
-                disabled={busy}
-                onClick={() => setTick((t) => t + 1)}
-              >
-                刷新任务
-              </button>
-              <button
-                type="button"
-                className="secondary"
-                disabled={busy}
-                onClick={exitToProjectList}
-              >
-                项目列表
-              </button>
-              <button
-                type="button"
-                className="secondary"
-                disabled={busy}
-                onClick={() => void deleteProject(credential)}
-              >
-                删除项目
-              </button>
-            </div>
+            <div className="scroll-fade" aria-hidden="true" />
+          </div>
+
+          {railVisible && (
+            <SourcesRail
+              sources={sources}
+              events={events}
+              tab={railTab}
+              activeSourceId={activeSourceId}
+              onTab={setRailTab}
+              onSelect={handleCitation}
+              onClose={() => setRailOpen(false)}
+              onToast={notify}
+            />
           )}
         </div>
-        {task?.approval && task.status === "pending" && (
-          <section className="approval-card" aria-label="待审批请求">
-            <span className="eyebrow">● APPROVAL REQUIRED</span>
-            <h3>
-              {
-                {
-                  clarification: "澄清研究范围",
-                  plan: "确认研究计划",
-                  plan_adjustment: "确认补充研究",
-                  tool: "确认工具或联网访问",
-                }[task.approval.kind]
-              }
-            </h3>
-            <p>{task.approval.reason}</p>
-            {task.approval.goal && <p>初始目标：{task.approval.goal}</p>}
-            {task.approval.serves && <p>这一跳回答：{task.approval.serves}</p>}
-            <ul>
-              {task.approval.questions.map((q) => (
-                <li key={q}>{q}</li>
-              ))}
-            </ul>
-            <p>到期：{new Date(task.approval.expiresAt).toLocaleString()}</p>
-            <label>
-              {task.approval.kind === "clarification"
-                ? "确认后的问题"
-                : "执行查询（可调整）"}
-              <textarea
-                maxLength={8000}
-                value={value}
-                onChange={(e) => setValue(e.target.value)}
-              />
-            </label>
+
+        {(status === "interrupted" || status === "ready") && task && (
+          <div className="resume-bar">
+            <span>
+              {status === "interrupted"
+                ? "This run stopped mid-flight to avoid replaying an uncertain tool call."
+                : "This project is ready to resume."}
+            </span>
             <button
-              disabled={busy || !value.trim()}
-              onClick={() => void send("approve")}
-            >
-              批准并继续
-            </button>
-            <button
-              className="secondary"
+              type="button"
+              className="button-ghost"
               disabled={busy}
-              onClick={() => void send("reject")}
+              onClick={() => void resume()}
             >
-              拒绝并结束
+              Resume run
             </button>
-          </section>
-        )}
-        {task && ["queued", "ready", "running"].includes(task.status) && (
-          <button disabled={busy} onClick={() => void send("resume")}>
-            重启后恢复 / 检查执行状态
-          </button>
-        )}
-        {task?.status !== "pending" && (
-          <div className="composer">
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                void send();
-              }}
-            >
-              <DocumentUpload
-                disabled={busy}
-                onUploaded={(name) =>
-                  setAttachments((items) => [...new Set([...items, name])])
-                }
-              />
-              {attachments.length > 0 && (
-                <small>已附资料：{attachments.join("、")}</small>
-              )}
-              <label>
-                研究问题
-                <textarea
-                  required
-                  placeholder="输入问题或 /help 查看命令…"
-                  rows={2}
-                  maxLength={8000}
-                  value={question}
-                  onChange={(e) => setQuestion(e.target.value)}
-                />
-              </label>
-              <button
-                disabled={
-                  busy ||
-                  !question.trim() ||
-                  task?.status === "running" ||
-                  task?.status === "pending"
-                }
-              >
-                {credential ? "发送" : "新建项目"}
-              </button>
-            </form>
           </div>
         )}
+
+        {approval && (
+          <ApprovalDock
+            approval={approval}
+            value={approvalValue}
+            onChange={setApprovalValue}
+            onApprove={() => void approve()}
+            onReject={() => void reject()}
+            busy={busy}
+          />
+        )}
+
+        <div className="dock" aria-label="研究操作区">
+          <Composer
+            value={question}
+            onChange={setQuestion}
+            onSubmit={() => void submit()}
+            busy={busy}
+            disabled={disabled}
+            {...(disabledReason ? { disabledReason } : {})}
+            attachments={attachments}
+            onUploaded={(name) => {
+              setAttachments((items) => [...new Set([...items, name])]);
+              notify(`${name} added to the knowledge base`);
+            }}
+            onRemoveAttachment={(name) =>
+              setAttachments((items) => items.filter((item) => item !== name))
+            }
+            placeholder={
+              approval
+                ? "Waiting for your approval…"
+                : credential
+                  ? status === "running"
+                    ? "The agent is working — draft your next question"
+                    : "Ask a follow-up, or refine the report…"
+                  : "Ask a research question…"
+            }
+            mode={credential ? "followup" : "new"}
+            inputRef={composerRef}
+          />
+        </div>
       </div>
-    </section>
+
+      {toast && (
+        <div
+          className={`toast tone-${toast.tone}`}
+          role="status"
+          key={toast.id}
+        >
+          {toast.message}
+        </div>
+      )}
+    </div>
   );
 }

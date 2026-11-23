@@ -33,7 +33,7 @@ pnpm cli
 
 Enter a question to create a project; after completion, enter another message to revise it. Use `/upload path/to/notes.md` to index a document. Changing the embedding provider, model or dimensions invalidates the index, so run `pnpm --filter @research-lab/api rag:reindex` and restart; with PGlite stop the API first, because the data directory is held by a single process.
 
-The API defaults to <http://localhost:3001>. The legacy browser client can be started separately with `pnpm dev:web`.
+The API defaults to <http://localhost:3001>. The agent workbench UI can be started separately with `pnpm dev:web`.
 
 ## Verify
 
@@ -45,7 +45,7 @@ pnpm test
 pnpm build
 ```
 
-`apps/api` owns research and persistence; `apps/cli` is the main interface; `apps/web` retains the legacy browser client.
+`apps/api` owns research and persistence; `apps/cli` is the terminal interface; `apps/web` is the agent workbench UI: project sidebar, tool-call timeline, human approvals, report rendering with clickable citations, and a sources/activity rail.
 
 ## Try a model
 

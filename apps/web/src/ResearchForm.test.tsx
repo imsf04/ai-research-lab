@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+
 import { ResearchForm } from "./ResearchForm";
 
 afterEach(() => {
@@ -8,7 +9,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it("submits a question and displays its completed report", async () => {
+it("submits a question and displays its completed report, steps and sources", async () => {
   const events = [
     { type: "AGENT_STARTED" },
     { type: "AGENT_DECISION", message: "路径选择：MCP 文档工具" },
@@ -60,27 +61,34 @@ it("submits a question and displays its completed report", async () => {
     target: { value: "Compare designs" },
   });
   fireEvent.click(screen.getByText("开始研究"));
+
   expect(await screen.findByText("研究状态：completed")).toBeTruthy();
-  expect(screen.getByText(/Analysis/)).toBeTruthy();
-  const reference = screen.getByRole("link", { name: "[RAG:1]" });
-  fireEvent.click(reference);
-  expect(document.getElementById("source-RAG:1")?.hasAttribute("open")).toBe(
-    true,
-  );
-  expect(screen.getByText("计划：查明存储理由")).toBeTruthy();
-  expect(screen.getByText("Coordinator：委派研究执行者")).toBeTruthy();
-  expect(screen.getByText("Critic：需要修订引用")).toBeTruthy();
-  expect(screen.getByText("Coordinator：审查通过")).toBeTruthy();
-  expect(screen.getByText("A2A 已发现 researcher")).toBeTruthy();
-  expect(screen.getByText("A2A researcher：正在处理")).toBeTruthy();
   expect(screen.getByText("任务 ID：test-task")).toBeTruthy();
-  expect(screen.getByText("读取成功：storage.md")).toBeTruthy();
-  expect(screen.getByText("原始证据片段")).toBeTruthy();
-  expect(screen.getByText("storage.md：第 2–4 行")).toBeTruthy();
-  expect(screen.getByText("路径选择：MCP 文档工具")).toBeTruthy();
-  expect(screen.getByText("证据评估：证据足够")).toBeTruthy();
-  expect(screen.getByText("取证结束：证据足够")).toBeTruthy();
-  expect(screen.getByText(/MCP 文档片段/)).toBeTruthy();
+  expect(screen.getAllByText(/Analysis/).length).toBeGreaterThan(0);
+
+  fireEvent.click(screen.getByRole("button", { name: "1" }));
+  expect(await screen.findByText("原始证据片段")).toBeTruthy();
+  expect(screen.getAllByText(/storage\.md · lines 2–4/).length).toBeGreaterThan(
+    0,
+  );
+
+  for (const message of [
+    "路径选择：MCP 文档工具",
+    "MCP 已发现资料工具",
+    "读取成功：storage.md",
+    "证据评估：证据足够",
+    "取证结束：证据足够",
+    "A2A 已发现 researcher",
+    "A2A researcher：正在处理",
+    "Coordinator：委派研究执行者",
+    "Critic：需要修订引用",
+    "Coordinator：审查通过",
+    "计划：查明存储理由",
+  ]) {
+    expect(
+      screen.getAllByText(message, { exact: false }).length,
+    ).toBeGreaterThan(0);
+  }
 });
 
 it("cancels a pending request", async () => {
